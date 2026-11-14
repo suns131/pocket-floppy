@@ -1,0 +1,289 @@
+From a1ad9e737d1895bba057d0119e5344df60b08c59 Mon Sep 17 00:00:00 2001
+From: Pocket Floppy <noreply@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 15:57:58 +0800
+Subject: [PATCH] =?UTF-8?q?=E5=8F=A3=E8=A2=8B=E8=BD=AF=E7=9B=98=EF=BC=9AiO?=
+ =?UTF-8?q?S=20=E6=9E=84=E5=BB=BA=E3=80=81Win32API=20=E6=9B=BF=E4=BB=A3?=
+ =?UTF-8?q?=E5=AE=9E=E7=8E=B0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- binding-sandbox：Win32API 常见调用的替代答复（读 Game.ini、文字编码转换、窗口与屏幕大小、计时等）
+- filesystem / encoding：iconv_open 失败时不再崩溃（"utf-8-mac" 只在 Apple 平台有）
+- cross-ios-sim.ini / cross-ios-dev.ini：iOS 交叉编译配置
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ binding-sandbox/binding-sandbox.cpp | 156 ++++++++++++++++++++++++++++
+ cross-ios-dev.ini                   |  17 +++
+ cross-ios-sim.ini                   |  17 +++
+ src/filesystem/filesystem.cpp       |   4 +-
+ src/util/encoding.h                 |   2 +
+ 5 files changed, 195 insertions(+), 1 deletion(-)
+ create mode 100644 cross-ios-dev.ini
+ create mode 100644 cross-ios-sim.ini
+
+diff --git a/binding-sandbox/binding-sandbox.cpp b/binding-sandbox/binding-sandbox.cpp
+index 720ea7e..1457416 100644
+--- a/binding-sandbox/binding-sandbox.cpp
++++ b/binding-sandbox/binding-sandbox.cpp
+@@ -638,6 +638,161 @@ static VALUE to_utf8_bang(VALUE self) {
+     return sb()->bind<struct coro>()()(self);
+ }
+ 
++
++// 口袋软盘: Win32API stand-ins, evaluated after the native class is defined.
++static const char pocket_win32api_rb[] = R"POCKETRB(
++# 口袋软盘: stand-ins for the Windows calls RPG Maker scripts make through Win32API. Nothing of
++# Windows exists here; each call answers the way a game expects, so a script that reads Game.ini,
++# asks for the window or converts text keeps working instead of stopping the game at start.
++class Win32API
++  POCKET_NAMES = %w[GetPrivateProfileString GetPrivateProfileInt WritePrivateProfileString MessageBox
++    FindWindow FindWindowEx GetModuleFileName GetModuleHandle SetWindowText GetWindowText GetCurrentDirectory
++    GetUserName GetComputerName CreateFile GetVersionEx LoadLibrary GetProcAddress lstrlen lstrcpy
++    PlaySound mciSendString ShellExecute GetFileAttributes]
++  def initialize(dll, func, imports = nil, exports = nil)
++    @dll = dll.to_s
++    name = func.to_s
++    base = name.sub(/[AW]\z/, '')
++    @func = (base != name && POCKET_NAMES.include?(base)) ? base : name
++    @wide = name.end_with?('W')
++    @exports = exports.to_s.downcase
++    yield self if block_given?
++  end
++  def pocket_write(buf, data)
++    return unless buf.is_a?(String) && !buf.frozen?
++    data = data.to_s.b
++    n = [data.bytesize, buf.bytesize].min
++    enc = buf.encoding
++    buf.force_encoding(Encoding::BINARY)
++    buf[0, n] = data[0, n]
++    buf.force_encoding(enc)
++  end
++  def pocket_cstr(v)
++    return '' unless v.is_a?(String)
++    s = v.b
++    i = s.index("\0".b)
++    i ? s[0, i] : s
++  end
++  def pocket_ini(file, section, key)
++    path = pocket_cstr(file).force_encoding('UTF-8').tr('\\', '/').sub(%r{\A\./}, '')
++    text = nil
++    [path, File.basename(path), '/Game/' + path].each do |p|
++      begin
++        text = File.binread(p)
++        break
++      rescue StandardError
++      end
++    end
++    return nil unless text
++    want = pocket_cstr(section).downcase
++    k = pocket_cstr(key).downcase
++    current = nil
++    text.split(/\r?\n/).each do |line|
++      line = line.b.strip
++      if line =~ /\A\[(.*)\]\z/
++        current = $1.downcase
++      elsif current == want && (i = line.index('='.b)) && line[0, i].strip.downcase == k
++        return line[(i + 1)..-1].strip
++      end
++    end
++    nil
++  end
++  def pocket_rect(buf, x, y, w, h)
++    pocket_write(buf, [x, y, w, h].pack('l4'))
++  end
++  def pocket_screen
++    w = (Graphics.width rescue 640)
++    h = (Graphics.height rescue 480)
++    [w, h]
++  end
++  def call(*a)
++    r = pocket_answer(*a)
++    return '' if @exports == 'p' && !r.is_a?(String)
++    r
++  rescue StandardError
++    @exports == 'p' ? '' : 0
++  end
++  alias Call call
++  def pocket_answer(*a)
++    case @func
++    when 'GetPrivateProfileString'
++      value = a[1].nil? ? nil : pocket_ini(a[5], a[0], a[1])
++      value ||= pocket_cstr(a[2])
++      size = a[4].to_i
++      value = value[0, [size - 1, 0].max] if size > 0
++      if @wide
++        w = value.dup.force_encoding('UTF-8').encode('UTF-16LE').b rescue value
++        pocket_write(a[3], w + "\0\0".b)
++        w.bytesize / 2
++      else
++        pocket_write(a[3], value + "\0".b)
++        value.bytesize
++      end
++    when 'GetPrivateProfileInt'
++      v = pocket_ini(a[3], a[0], a[1])
++      v ? v.to_i : a[2].to_i
++    when 'WritePrivateProfileString' then 1
++    when 'GetAsyncKeyState', 'GetKeyState' then 0
++    when 'GetKeyboardState' then pocket_write(a[0], "\0" * 256); 1
++    # The window is 42, the number mkxp-z's own win32_wrap.rb answers for it.
++    when 'FindWindow', 'FindWindowEx', 'GetActiveWindow', 'GetForegroundWindow', 'GetDesktopWindow',
++         'GetFocus', 'GetParent' then 42
++    when 'GetModuleHandle', 'GetCurrentProcess', 'GetDC', 'LoadLibrary' then 1
++    when 'GetSystemMetrics'
++      w, h = pocket_screen
++      { 0 => w, 1 => h, 16 => w, 17 => h, 4 => 0, 7 => 0, 8 => 0, 32 => 0, 33 => 0 }.fetch(a[0].to_i, 0)
++    when 'GetClientRect', 'GetWindowRect'
++      w, h = pocket_screen
++      pocket_rect(a[1], 0, 0, w, h); 1
++    when 'GetCursorPos' then pocket_write(a[0], [0, 0].pack('l2')); 1
++    when 'ScreenToClient', 'ClientToScreen', 'SetCursorPos', 'ClipCursor', 'SetWindowPos', 'MoveWindow',
++         'ShowWindow', 'UpdateWindow', 'SetForegroundWindow', 'SetActiveWindow', 'SetFocus',
++         'SetWindowText', 'ReleaseDC', 'FreeLibrary', 'CloseHandle', 'EnableWindow' then 1
++    when 'MessageBox' then 1
++    when 'GetTickCount', 'timeGetTime' then (Time.now.to_f * 1000).to_i & 0xffffffff
++    when 'QueryPerformanceCounter' then pocket_write(a[0], [(Time.now.to_f * 1_000_000).to_i].pack('q')); 1
++    when 'QueryPerformanceFrequency' then pocket_write(a[0], [1_000_000].pack('q')); 1
++    when 'Sleep' then sleep(a[0].to_i / 1000.0) if a[0].to_i > 0; 0
++    when 'GetModuleFileName'
++      pocket_write(a[1], "Game.exe\0"); 8
++    when 'GetCurrentDirectory'
++      pocket_write(a[1], ".\0"); 1
++    when 'GetWindowText' then pocket_write(a[1], "\0"); 0
++    when 'GetUserName', 'GetComputerName'
++      pocket_write(a[0], "Player\0"); pocket_write(a[1], [7].pack('l')) if a[1].is_a?(String); 1
++    when 'GetUserDefaultLangID', 'GetSystemDefaultLangID', 'GetUserDefaultUILanguage', 'GetSystemDefaultUILanguage',
++         'GetUserDefaultLCID', 'GetSystemDefaultLCID', 'GetThreadLocale' then 0x0411
++    when 'GetACP', 'GetOEMCP' then 932
++    when 'GetVersion' then 0x0A
++    when 'MultiByteToWideChar'
++      src = a[3].to_i == -1 ? pocket_cstr(a[2]) : a[2].to_s.b[0, a[3].to_i]
++      text = src.dup.force_encoding(a[0].to_i == 932 ? 'Shift_JIS' : 'UTF-8')
++      w = (text.encode('UTF-16LE') rescue src.force_encoding('UTF-8').encode('UTF-16LE', invalid: :replace, undef: :replace)).b
++      w << "\0\0".b if a[3].to_i == -1
++      pocket_write(a[4], w) if a[5].to_i > 0
++      w.bytesize / 2
++    when 'WideCharToMultiByte'
++      raw = a[2].to_s.b
++      if a[3].to_i == -1
++        i = 0
++        i += 2 while i + 1 < raw.bytesize && raw[i, 2] != "\0\0".b
++        raw = raw[0, i]
++      else
++        raw = raw[0, a[3].to_i * 2]
++      end
++      out = raw.force_encoding('UTF-16LE').encode(a[0].to_i == 932 ? 'Shift_JIS' : 'UTF-8', invalid: :replace, undef: :replace).b rescue raw
++      out << "\0".b if a[3].to_i == -1
++      pocket_write(a[4], out) if a[5].to_i > 0
++      out.bytesize
++    when 'lstrlen' then pocket_cstr(a[0]).bytesize
++    when 'RtlMoveMemory', 'CopyMemory'
++      pocket_write(a[0], a[1].to_s.b[0, a[2].to_i]) if a[1].is_a?(String); 0
++    when 'GetFileAttributes' then -1
++    else 0
++    end
++  end
++end
++)POCKETRB";
+ static VALUE win32api_initialize(int32_t argc, wasm_ptr_t argv, VALUE self) {
+     struct coro : boost::asio::coroutine {
+         typedef decl_slots<VALUE> slots;
+@@ -807,6 +962,7 @@ void sandbox_binding_init::operator()() {
+         SANDBOX_AWAIT(rb_define_method, win32api_class, "initialize", (VALUE (*)(ANYARGS))win32api_initialize, -1);
+         SANDBOX_AWAIT(rb_define_method, win32api_class, "call", (VALUE (*)(ANYARGS))win32api_call, -1);
+         SANDBOX_AWAIT(rb_define_alias, win32api_class, "Call", "call");
++        SANDBOX_AWAIT(rb_eval_string, pocket_win32api_rb);
+ 
+         if (rgssVer >= 3) {
+             SANDBOX_AWAIT(rb_define_module_function, sb()->rb_mKernel(), "rgss_main", (VALUE (*)(ANYARGS))rgss_main, 0);
+diff --git a/cross-ios-dev.ini b/cross-ios-dev.ini
+new file mode 100644
+index 0000000..80685a9
+--- /dev/null
++++ b/cross-ios-dev.ini
+@@ -0,0 +1,17 @@
++[binaries]
++c = ['xcrun', '--sdk', 'iphoneos', 'clang', '--target=arm64-apple-ios18.0']
++cpp = ['xcrun', '--sdk', 'iphoneos', 'clang++', '--target=arm64-apple-ios18.0']
++objc = ['xcrun', '--sdk', 'iphoneos', 'clang', '--target=arm64-apple-ios18.0']
++objcpp = ['xcrun', '--sdk', 'iphoneos', 'clang++', '--target=arm64-apple-ios18.0']
++ar = 'ar'
++strip = 'strip'
++cmake = 'cmake'
++[host_machine]
++system = 'darwin'
++subsystem = 'ios'
++cpu_family = 'aarch64'
++cpu = 'generic-armv8-a'
++endian = 'little'
++[cmake]
++CMAKE_SYSTEM_NAME = 'Darwin'
++CMAKE_OSX_ARCHITECTURES = 'arm64'
+diff --git a/cross-ios-sim.ini b/cross-ios-sim.ini
+new file mode 100644
+index 0000000..6d7ea2e
+--- /dev/null
++++ b/cross-ios-sim.ini
+@@ -0,0 +1,17 @@
++[binaries]
++c = ['xcrun', '--sdk', 'iphonesimulator', 'clang', '--target=arm64-apple-ios18.0-simulator']
++cpp = ['xcrun', '--sdk', 'iphonesimulator', 'clang++', '--target=arm64-apple-ios18.0-simulator']
++objc = ['xcrun', '--sdk', 'iphonesimulator', 'clang', '--target=arm64-apple-ios18.0-simulator']
++objcpp = ['xcrun', '--sdk', 'iphonesimulator', 'clang++', '--target=arm64-apple-ios18.0-simulator']
++ar = 'ar'
++strip = 'strip'
++cmake = 'cmake'
++[host_machine]
++system = 'darwin'
++subsystem = 'ios'
++cpu_family = 'aarch64'
++cpu = 'generic-armv8-a'
++endian = 'little'
++[cmake]
++CMAKE_SYSTEM_NAME = 'Darwin'
++CMAKE_OSX_ARCHITECTURES = 'arm64'
+diff --git a/src/filesystem/filesystem.cpp b/src/filesystem/filesystem.cpp
+index 98890ba..e1134dd 100644
+--- a/src/filesystem/filesystem.cpp
++++ b/src/filesystem/filesystem.cpp
+@@ -393,13 +393,15 @@ struct CacheEnumData {
+ 
+   ~CacheEnumData() {
+ #ifdef __APPLE__
+-    iconv_close(nfd2nfc);
++    if (nfd2nfc != (iconv_t)-1) iconv_close(nfd2nfc);
+ #endif
+   }
+ 
+   /* Converts in-place */
+   void toNFC(char *inout) {
+ #ifdef __APPLE__
++    /* "utf-8-mac" is Apple's own iconv's; without it (GNU libiconv on iOS) names stay as they are */
++    if (nfd2nfc == (iconv_t)-1) return;
+     size_t srcSize = strlen(inout);
+     size_t bufSize = sizeof(buf);
+     char *bufPtr = buf;
+diff --git a/src/util/encoding.h b/src/util/encoding.h
+index 2cb0cae..a7cbd3b 100644
+--- a/src/util/encoding.h
++++ b/src/util/encoding.h
+@@ -42,6 +42,7 @@ static std::string convertString(const std::string &str, const char *charset) {
+     }
+     
+     iconv_t cd = iconv_open("UTF-8", charset);
++    if (cd == (iconv_t)-1) return std::string(str);   /* an encoding this iconv does not know */
+     
+     size_t inLen = str.size();
+     size_t outLen = inLen * 4;
+@@ -70,6 +71,7 @@ static std::string convertStringToUtf32(const std::string &str) {
+     std::string charset = getCharset(str);
+     
+     iconv_t cd = iconv_open("UCS-4-INTERNAL", charset.c_str());
++    if (cd == (iconv_t)-1) return std::string();
+     
+     size_t inLen = str.size();
+     size_t outLen = inLen * 4;
+-- 
+2.54.0 (Apple Git-157)
+

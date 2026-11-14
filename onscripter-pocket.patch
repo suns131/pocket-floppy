@@ -1,0 +1,86 @@
+diff -ru src/ONScripter.cpp work/ONScripter.cpp
+--- src/ONScripter.cpp	2022-07-18 10:20:30
++++ work/ONScripter.cpp	2026-11-15 01:49:04
+@@ -110,7 +110,8 @@
+     }
+ #endif
+ 
+-#if !defined(IOS)
++// In the app a controller is read by the app itself and reaches the game as keys: the engine does not open it too.
++#if !defined(IOS) && !defined(POCKET_FLOPPY)
+ #if defined(ANDROID)
+     SDL_SetHint(SDL_HINT_ACCELEROMETER_AS_JOYSTICK, "0");
+ #endif
+@@ -184,9 +185,17 @@
+         utils::printError("Could not create window: %s\n", SDL_GetError());
+         exit(-1);
+     }
++#ifdef POCKET_FLOPPY
++    Uint32 render_flag = SDL_RENDERER_SOFTWARE;
++#else
+     Uint32 render_flag = SDL_RENDERER_ACCELERATED;
++#endif
+     if (vsync) render_flag |= SDL_RENDERER_PRESENTVSYNC;
+     renderer = SDL_CreateRenderer(window, -1, render_flag);
++#ifdef POCKET_FLOPPY
++    if (renderer == NULL) utils::printError("Could not create a renderer: %s\n", SDL_GetError());
++    else { SDL_RendererInfo made; SDL_GetRendererInfo(renderer, &made); utils::printInfo("Renderer: %s\n", made.name); }
++#endif
+ 
+     SDL_RenderSetLogicalSize(renderer, screen_width, screen_height);
+     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+diff -ru src/Utils.h work/Utils.h
+--- src/Utils.h	2022-07-18 10:20:30
++++ work/Utils.h	2026-11-15 00:39:49
+@@ -55,6 +55,8 @@
+ 		LPWSTR wstr = new WCHAR[128];
+ 		MByteToWChar(buf, wstr, 256);
+ 		OutputDebugString(wstr);
++#elif defined(POCKET_FLOPPY)
++		pocket_ons_say(0, format, ap);
+ #else
+ 		vprintf(format, ap);
+ #endif
+@@ -72,6 +74,8 @@
+ 		LPWSTR wstr = new WCHAR[128];
+ 		MByteToWChar(buf, wstr, 256);
+ 		OutputDebugString(wstr);
++#elif defined(POCKET_FLOPPY)
++		pocket_ons_say(1, format, ap);
+ #else
+ 		vfprintf(stderr, format, ap);
+ #endif
+diff -ru src/builtin_dll/layer_oldmovie.cpp work/builtin_dll/layer_oldmovie.cpp
+--- src/builtin_dll/layer_oldmovie.cpp	2022-07-18 10:20:30
++++ work/builtin_dll/layer_oldmovie.cpp	2026-11-15 00:41:30
+@@ -32,7 +32,13 @@
+ #define MAX_DUST_COUNT    10
+ #define MAX_SCRATCH_COUNT  6
+ 
++#ifdef POCKET_FLOPPY
++// one engine object per game, made anew for each: reached through a pointer
++extern ONScripter *pocket_ons_engine;
++#define ons (*pocket_ons_engine)
++#else
+ extern ONScripter ons;
++#endif
+ 
+ static int scratch_count;    // Number of scratches visible.
+ 
+diff -ru src/builtin_dll/layer_snow.cpp work/builtin_dll/layer_snow.cpp
+--- src/builtin_dll/layer_snow.cpp	2022-07-18 10:20:30
++++ work/builtin_dll/layer_snow.cpp	2026-11-15 00:41:30
+@@ -30,7 +30,13 @@
+ #include <stdlib.h>
+ #include <SDL_image.h>
+ 
++#ifdef POCKET_FLOPPY
++// one engine object per game, made anew for each: reached through a pointer
++extern ONScripter *pocket_ons_engine;
++#define ons (*pocket_ons_engine)
++#else
+ extern ONScripter ons;
++#endif
+ 
+ static const float FURU_RATE_COEF = 0.2;
+ static float *base_disp_table = NULL;

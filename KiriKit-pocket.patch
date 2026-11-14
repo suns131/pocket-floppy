@@ -1,0 +1,852 @@
+From 193a44111553300da8d2a4ff2af11e86a94908db Mon Sep 17 00:00:00 2001
+From: Pocket Floppy <noreply@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 15:57:53 +0800
+Subject: [PATCH] =?UTF-8?q?=E5=8F=A3=E8=A2=8B=E8=BD=AF=E7=9B=98=EF=BC=9A?=
+ =?UTF-8?q?=E7=B3=BB=E7=BB=9F=E8=A7=A3=E7=A0=81=E9=9F=B3=E9=A2=91=E3=80=81?=
+ =?UTF-8?q?=E6=9B=B4=E5=A4=9A=E5=BD=B1=E7=89=87=E6=A0=BC=E5=BC=8F=E3=80=81?=
+ =?UTF-8?q?json=20=E6=8F=92=E4=BB=B6=E7=AD=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Engine/environ/shiori_systemaudio.mm：MP3/AAC/M4A/FLAC 交给系统解码
+- 影片：放宽格式白名单，非 YUV420P 画面经 swscale 转换（POCKET_FFMPEG）
+- PSB：mdf 解包；SHIORIKRKR_DATA_PATH 设定存档路径
+- Engine/plugins/shiori_json.cpp：自写的 json.dll（evalJSON / evalJSONStorage / saveJSON / toJSONString）
+- 空的 wump3 / krmp3 插件
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Engine/CMakeLists.txt                |   3 +-
+ Engine/compat/libswscale/swscale.h   |   7 +
+ Engine/environ/shiori_environ.h      |   4 +
+ Engine/environ/shiori_systemaudio.mm | 162 +++++++++++
+ Engine/plugins/shiori_json.cpp       | 397 +++++++++++++++++++++++++++
+ Engine/shiori_plugin_links.cpp       |   3 +
+ Engine/shiorikrkr_host.mm            |   8 +-
+ Engine/shiorikrkr_movie.cpp          |  31 ++-
+ Engine/shiorikrkr_psbfile.cpp        |  20 +-
+ Scripts/krkr2/build-framework.sh     |  16 +-
+ 10 files changed, 639 insertions(+), 12 deletions(-)
+ create mode 100644 Engine/environ/shiori_systemaudio.mm
+ create mode 100644 Engine/plugins/shiori_json.cpp
+
+diff --git a/Engine/CMakeLists.txt b/Engine/CMakeLists.txt
+index ddfedc4..90f878d 100644
+--- a/Engine/CMakeLists.txt
++++ b/Engine/CMakeLists.txt
+@@ -155,7 +155,6 @@ shiori_plugin(PackinOne PackinOne.dll "${SDL3PLUGINS}" PackinOne.cpp)
+ shiori_plugin(lzfs lzfs.dll "${SDL3PLUGINS}" lzfs.cpp)
+ shiori_plugin(gfxEffect gfxEffect.dll "${SDL3PLUGINS}" gfxEffect.cpp)
+ shiori_plugin(layerExDraw layerExDraw.dll "${SDL3PLUGINS}/LayerExDraw" LayerExDraw.cpp)
+-
+ # ---- Shiori's environment (replaces krkr2's cocos2d-x one) ----
+ file(GLOB SHIORI_ENVIRON_SOURCES CONFIGURE_DEPENDS "${HERE}/environ/*.cpp" "${HERE}/environ/*.mm")
+ 
+@@ -163,7 +162,7 @@ set(SHIORI_SOURCES "${HERE}/shiorikrkr_host.mm" "${HERE}/cx_decrypt.cpp" "${HERE
+     "${HERE}/render/shiori_metal_render.mm" "${HERE}/render/shiori_layer_gpu.cpp" "${HERE}/shiorikrkr_movie.cpp")
+ set(SOURCES ${SHIORI_SOURCES} ${PARSERS} "${GEN}/tjsDateWordMap.inc" ${TJS2_SOURCES} ${BASE_SOURCES} ${VISUAL_SOURCES}
+     ${SOUND_SOURCES} ${UTILS_SOURCES} ${OTHER_CORE_SOURCES} ${SHIORI_ENVIRON_SOURCES}
+-    ${KRKR2_PLUGIN_SOURCES} ${PLUGIN_SOURCES} "${HERE}/getlangname.cpp" "${HERE}/plugins/shiori_steam.cpp" "${HERE}/plugins/shiori_gamepad.cpp" "${HERE}/plugins/shiori_wavefilters.cpp" "${HERE}/plugins/shiori_kztouch.cpp" "${HERE}/plugins/shiori_windows_standins.cpp" "${HERE}/shiori_plugin_links.cpp"
++    ${KRKR2_PLUGIN_SOURCES} ${PLUGIN_SOURCES} "${HERE}/getlangname.cpp" "${HERE}/plugins/shiori_steam.cpp" "${HERE}/plugins/shiori_gamepad.cpp" "${HERE}/plugins/shiori_wavefilters.cpp" "${HERE}/plugins/shiori_kztouch.cpp" "${HERE}/plugins/shiori_json.cpp" "${HERE}/plugins/shiori_windows_standins.cpp" "${HERE}/shiori_plugin_links.cpp"
+     "${HERE}/shiorikrkr_emote.cpp" "${HERE}/shiorikrkr_motion.cpp" "${HERE}/shiorikrkr_motionplayer.cpp" "${HERE}/shiorikrkr_psbfile.cpp" "${HERE}/datapack.cpp" "${HERE}/shiori_prefetch.cpp"
+     "${HERE}/plugins/shiori_textrender.cpp")
+ 
+diff --git a/Engine/compat/libswscale/swscale.h b/Engine/compat/libswscale/swscale.h
+index 33f9564..d94e441 100644
+--- a/Engine/compat/libswscale/swscale.h
++++ b/Engine/compat/libswscale/swscale.h
+@@ -4,5 +4,12 @@
+ 
+ // Shiori's FFmpeg is built without libswscale; krkr2's software render manager only names the
+ // type (its swscale path is compiled out, USE_SWSCALE is off).
++// 口袋软盘 links an FFmpeg that has libswscale (for KiriKiri movies in other picture layouts):
++// then the real header is used.
+ #pragma once
++#if __has_include_next(<libswscale/swscale.h>)
++#include_next <libswscale/swscale.h>
++#define SHIORI_HAS_SWSCALE 1
++#else
+ struct SwsContext;
++#endif
+diff --git a/Engine/environ/shiori_environ.h b/Engine/environ/shiori_environ.h
+index 1c9c00c..df32c2d 100644
+--- a/Engine/environ/shiori_environ.h
++++ b/Engine/environ/shiori_environ.h
+@@ -88,3 +88,7 @@ uint64_t audioRenders();
+ void audioShutdown();
+ 
+ } // namespace shiori
++
++// Sound formats krkr2 has no decoder of its own for (MP3, AAC, FLAC...), decoded by the system
++// (environ/shiori_systemaudio.mm).
++void ShioriRegisterSystemAudioDecoders();
+diff --git a/Engine/environ/shiori_systemaudio.mm b/Engine/environ/shiori_systemaudio.mm
+new file mode 100644
+index 0000000..ffbed71
+--- /dev/null
++++ b/Engine/environ/shiori_systemaudio.mm
+@@ -0,0 +1,162 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
++ * If a copy of the MPL was not distributed with this file, You can obtain one at
++ * https://mozilla.org/MPL/2.0/. */
++
++// Sound formats krkr2's own decoders don't cover (they read RIFF WAVE, Ogg Vorbis, Opus and TCWF),
++// decoded by the system's Audio Toolbox: MP3 above all (on Windows games play it through the
++// wump3 or krmp3 plug-ins), and AAC / M4A, AIFF, CAF and FLAC. The file is read through the
++// engine's own storage stream, so it works the same from an archive (data.xp3) or a folder.
++#include "shiori_environ.h"
++
++#include "tjsCommHead.h"
++#include "WaveIntf.h"
++#include "StorageIntf.h"
++#include "DebugIntf.h"
++
++#import <AudioToolbox/AudioToolbox.h>
++
++#include <mutex>
++
++namespace {
++
++struct SystemAudioFormat {
++    const tjs_char *extension;
++    AudioFileTypeID hint;
++};
++
++const SystemAudioFormat kFormats[] = {
++    {TJS_W(".mp3"), kAudioFileMP3Type},  {TJS_W(".mp2"), kAudioFileMP2Type},
++    {TJS_W(".m4a"), kAudioFileM4AType},  {TJS_W(".mp4"), kAudioFileMPEG4Type},
++    {TJS_W(".aac"), kAudioFileAAC_ADTSType}, {TJS_W(".caf"), kAudioFileCAFType},
++    {TJS_W(".aif"), kAudioFileAIFFType}, {TJS_W(".aiff"), kAudioFileAIFFType},
++    {TJS_W(".flac"), kAudioFileFLACType},
++};
++
++class SystemAudioDecoder : public tTVPWaveDecoder {
++public:
++    ~SystemAudioDecoder() override {
++        if (file_) ExtAudioFileDispose(file_);
++        if (audio_) AudioFileClose(audio_);
++        delete stream_;
++    }
++
++    bool open(const ttstr &storage, AudioFileTypeID hint) {
++        stream_ = TVPCreateStream(storage, TJS_BS_READ);
++        if (!stream_) return false;
++        size_ = stream_->GetSize();
++        if (AudioFileOpenWithCallbacks(this, readProc, nullptr, sizeProc, nullptr, hint, &audio_) != noErr) {
++            // The name may not tell the truth (an MP3 called .m4a and the like): let the system look.
++            audio_ = nullptr;
++            if (AudioFileOpenWithCallbacks(this, readProc, nullptr, sizeProc, nullptr, 0, &audio_) != noErr) {
++                audio_ = nullptr;
++                return false;
++            }
++        }
++        if (ExtAudioFileWrapAudioFileID(audio_, false, &file_) != noErr) { file_ = nullptr; return false; }
++
++        AudioStreamBasicDescription source = {};
++        UInt32 size = sizeof(source);
++        if (ExtAudioFileGetProperty(file_, kExtAudioFileProperty_FileDataFormat, &size, &source) != noErr) return false;
++        const UInt32 channels = source.mChannelsPerFrame ? source.mChannelsPerFrame : 2;
++        const double rate = source.mSampleRate > 0 ? source.mSampleRate : 44100;
++
++        AudioStreamBasicDescription client = {};
++        client.mFormatID = kAudioFormatLinearPCM;
++        client.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
++        client.mSampleRate = rate;
++        client.mChannelsPerFrame = channels;
++        client.mBitsPerChannel = 16;
++        client.mBytesPerFrame = 2 * channels;
++        client.mFramesPerPacket = 1;
++        client.mBytesPerPacket = client.mBytesPerFrame;
++        if (ExtAudioFileSetProperty(file_, kExtAudioFileProperty_ClientDataFormat, sizeof(client), &client) != noErr) return false;
++
++        SInt64 frames = 0;
++        size = sizeof(frames);
++        ExtAudioFileGetProperty(file_, kExtAudioFileProperty_FileLengthFrames, &size, &frames);
++
++        format_.SamplesPerSec = (tjs_uint)rate;
++        format_.Channels = channels;
++        format_.BitsPerSample = 16;
++        format_.BytesPerSample = 2;
++        format_.TotalSamples = frames > 0 ? (tjs_uint64)frames : 0;
++        format_.TotalTime = frames > 0 ? (tjs_uint64)(frames * 1000.0 / rate) : 0;
++        format_.SpeakerConfig = 0;
++        format_.IsFloat = false;
++        format_.Seekable = true;
++        frameBytes_ = client.mBytesPerFrame;
++        return true;
++    }
++
++    void GetFormat(tTVPWaveFormat &format) override { format = format_; }
++
++    bool Render(void *buf, tjs_uint bufsamplelen, tjs_uint &rendered) override {
++        rendered = 0;
++        if (!file_) return false;
++        while (rendered < bufsamplelen) {
++            AudioBufferList list;
++            list.mNumberBuffers = 1;
++            list.mBuffers[0].mNumberChannels = format_.Channels;
++            list.mBuffers[0].mDataByteSize = (UInt32)((bufsamplelen - rendered) * frameBytes_);
++            list.mBuffers[0].mData = (uint8_t *)buf + rendered * frameBytes_;
++            UInt32 frames = bufsamplelen - rendered;
++            if (ExtAudioFileRead(file_, &frames, &list) != noErr) return false;
++            if (frames == 0) return false; // the end
++            rendered += frames;
++        }
++        return true;
++    }
++
++    bool SetPosition(tjs_uint64 samplepos) override {
++        return file_ && ExtAudioFileSeek(file_, (SInt64)samplepos) == noErr;
++    }
++
++private:
++    static OSStatus readProc(void *context, SInt64 position, UInt32 count, void *buffer, UInt32 *actual) {
++        auto *self = static_cast<SystemAudioDecoder *>(context);
++        *actual = 0;
++        if (position >= (SInt64)self->size_) return noErr;
++        // The engine's streams aren't shared between threads; the system may read from its own.
++        std::lock_guard<std::mutex> lock(self->lock_);
++        if (self->stream_->Seek(position, TJS_BS_SEEK_SET) != (tjs_uint64)position) return kAudioFileUnspecifiedError;
++        *actual = self->stream_->Read(buffer, count);
++        return noErr;
++    }
++    static SInt64 sizeProc(void *context) { return (SInt64) static_cast<SystemAudioDecoder *>(context)->size_; }
++
++    tTJSBinaryStream *stream_ = nullptr;
++    tjs_uint64 size_ = 0;
++    AudioFileID audio_ = nullptr;
++    ExtAudioFileRef file_ = nullptr;
++    tTVPWaveFormat format_ = {};
++    UInt32 frameBytes_ = 4;
++    std::mutex lock_;
++};
++
++class SystemAudioDecoderCreator : public tTVPWaveDecoderCreator {
++public:
++    tTVPWaveDecoder *Create(const ttstr &storagename, const ttstr &extension) override {
++        for (const auto &format : kFormats) {
++            if (extension != format.extension) continue;
++            auto *decoder = new SystemAudioDecoder();
++            try {
++                if (decoder->open(storagename, format.hint)) return decoder;
++            } catch (...) {
++            }
++            delete decoder;
++            TVPAddLog(TJS_W("Shiori: the system could not decode ") + storagename);
++            return nullptr;
++        }
++        return nullptr;
++    }
++};
++
++SystemAudioDecoderCreator creator;
++
++} // namespace
++
++// Called as each game starts (the engine's decoder list is built by then); added once.
++void ShioriRegisterSystemAudioDecoders() {
++    static std::once_flag once;
++    std::call_once(once, [] { TVPRegisterWaveDecoderCreator(&creator); });
++}
+diff --git a/Engine/plugins/shiori_json.cpp b/Engine/plugins/shiori_json.cpp
+new file mode 100644
+index 0000000..1c4e232
+--- /dev/null
++++ b/Engine/plugins/shiori_json.cpp
+@@ -0,0 +1,397 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
++ * If a copy of the MPL was not distributed with this file, You can obtain one at
++ * https://mozilla.org/MPL/2.0/. */
++
++// json.dll: what KiriKiri games get from the JSON plug-in, on the engine's own types.
++//   Scripts.evalJSON(text)                    -> Dictionary / Array / value
++//   Scripts.evalJSONStorage(file[, utf8])     -> the same, read from storage (any text encoding)
++//   Scripts.saveJSON(file, value[, utf8[, newline]])
++//   Scripts.toJSONString(value[, newline])
++// The reader is lenient like the original: comments, single quotes, bare keys, '=' or '=>' after a
++// key, ';' between members and trailing commas are accepted. true/false become 1/0, null void.
++// krkr2's own json folder is only a placeholder; krkrsdl3's assumes UTF-8 strings.
++#include "tjsCommHead.h"
++#include "tjsArray.h"
++#include "tjsDictionary.h"
++#include "StorageIntf.h"
++#include "TextStream.h"
++#include "MsgIntf.h"
++#include <ncbind.hpp>
++#include <cmath>
++#include <string>
++
++#undef NCB_MODULE_NAME
++#define NCB_MODULE_NAME TJS_W("json.dll")
++
++namespace {
++
++struct Reader {
++    const tjs_char *p;
++    const tjs_char *end;
++
++    [[noreturn]] void fail(const char *what) {
++        TVPThrowExceptionMessage((ttstr(TJS_W("JSON: ")) + ttstr(what)).c_str());
++        __builtin_unreachable(); // it always throws
++    }
++
++    void space() {
++        for (;;) {
++            while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == 0xFEFF)) ++p;
++            if (p + 1 < end && p[0] == '/' && p[1] == '/') {
++                while (p < end && *p != '\n') ++p;
++            } else if (p + 1 < end && p[0] == '/' && p[1] == '*') {
++                p += 2;
++                while (p + 1 < end && !(p[0] == '*' && p[1] == '/')) ++p;
++                if (p + 1 >= end) fail("comment not closed");
++                p += 2;
++            } else {
++                return;
++            }
++        }
++    }
++
++    static int hex(tjs_char c) {
++        if (c >= '0' && c <= '9') return c - '0';
++        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
++        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
++        return -1;
++    }
++
++    ttstr string() {
++        tjs_char quote = *p++;
++        std::u16string out;
++        while (p < end && *p != quote) {
++            tjs_char c = *p++;
++            if (c != '\\') { out.push_back(c); continue; }
++            if (p >= end) break;
++            c = *p++;
++            switch (c) {
++            case 'n': out.push_back('\n'); break;
++            case 't': out.push_back('\t'); break;
++            case 'r': out.push_back('\r'); break;
++            case 'b': out.push_back('\b'); break;
++            case 'f': out.push_back('\f'); break;
++            case 'u': {
++                int v = 0;
++                for (int i = 0; i < 4; i++) {
++                    int h = p < end ? hex(*p) : -1;
++                    if (h < 0) fail("bad \\u escape");
++                    v = v * 16 + h; ++p;
++                }
++                out.push_back(tjs_char(v));
++                break;
++            }
++            default: out.push_back(c);
++            }
++        }
++        if (p >= end) fail("string not closed");
++        ++p;
++        return ttstr(out.c_str());
++    }
++
++    static bool bare(tjs_char c) {
++        return c == '_' || c == '$' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0x80;
++    }
++
++    ttstr word() {
++        const tjs_char *s = p;
++        while (p < end && bare(*p)) ++p;
++        if (p == s) fail("unexpected character");
++        return ttstr(std::u16string(s, p - s).c_str());
++    }
++
++    tTJSVariant number() {
++        const tjs_char *s = p;
++        if (*p == '-' || *p == '+') ++p;
++        bool real = false;
++        while (p < end && ((*p >= '0' && *p <= '9') || *p == '.' || *p == 'e' || *p == 'E' ||
++                           ((*p == '-' || *p == '+') && (p[-1] == 'e' || p[-1] == 'E')))) {
++            if (*p == '.' || *p == 'e' || *p == 'E') real = true;
++            ++p;
++        }
++        std::string text;
++        for (const tjs_char *q = s; q < p; ++q) text.push_back(char(*q));
++        if (!real) {
++            errno = 0;
++            long long v = strtoll(text.c_str(), nullptr, 10);
++            if (errno == 0) return tTJSVariant(tTVInteger(v));
++        }
++        return tTJSVariant(tTVReal(strtod(text.c_str(), nullptr)));
++    }
++
++    tTJSVariant value() {
++        space();
++        if (p >= end) fail("unexpected end");
++        tjs_char c = *p;
++        if (c == '{') return object();
++        if (c == '[') return array();
++        if (c == '"' || c == '\'') return tTJSVariant(string());
++        if (c == '-' || c == '+' || (c >= '0' && c <= '9') || c == '.') return number();
++        ttstr w = word();
++        if (w == TJS_W("true")) return tTJSVariant(tTVInteger(1));
++        if (w == TJS_W("false")) return tTJSVariant(tTVInteger(0));
++        if (w == TJS_W("null") || w == TJS_W("void") || w == TJS_W("undefined")) return tTJSVariant();
++        return tTJSVariant(w);
++    }
++
++    tTJSVariant object() {
++        ++p;
++        iTJSDispatch2 *dict = TJSCreateDictionaryObject();
++        tTJSVariant result(dict, dict);
++        dict->Release();
++        for (;;) {
++            space();
++            if (p >= end) fail("object not closed");
++            if (*p == '}') { ++p; break; }
++            ttstr key = (*p == '"' || *p == '\'') ? string() : word();
++            space();
++            if (p < end && *p == ':') ++p;
++            else if (p + 1 < end && p[0] == '=' && p[1] == '>') p += 2;
++            else if (p < end && *p == '=') ++p;
++            else fail("':' expected after a key");
++            tTJSVariant v = value();
++            dict->PropSet(TJS_MEMBERENSURE, key.c_str(), nullptr, &v, dict);
++            space();
++            if (p < end && (*p == ',' || *p == ';')) { ++p; continue; }
++            if (p < end && *p == '}') { ++p; break; }
++            fail("',' or '}' expected");
++        }
++        return result;
++    }
++
++    tTJSVariant array() {
++        ++p;
++        iTJSDispatch2 *arr = TJSCreateArrayObject();
++        tTJSVariant result(arr, arr);
++        arr->Release();
++        tjs_int index = 0;
++        for (;;) {
++            space();
++            if (p >= end) fail("array not closed");
++            if (*p == ']') { ++p; break; }
++            tTJSVariant v = value();
++            arr->PropSetByNum(TJS_MEMBERENSURE, index++, &v, arr);
++            space();
++            if (p < end && (*p == ',' || *p == ';')) { ++p; continue; }
++            if (p < end && *p == ']') { ++p; break; }
++            fail("',' or ']' expected");
++        }
++        return result;
++    }
++};
++
++tTJSVariant parse(const ttstr &text) {
++    Reader r{text.c_str(), text.c_str() + text.length()};
++    tTJSVariant v = r.value();
++    return v;
++}
++
++struct Writer {
++    std::u16string out;
++    bool pretty;
++    int depth = 0;
++
++    void newline() {
++        if (!pretty) return;
++        out.push_back('\n');
++        for (int i = 0; i < depth; i++) out.append(u"  ");
++    }
++
++    void quote(const tjs_char *s) {
++        out.push_back('"');
++        for (; s && *s; ++s) {
++            tjs_char c = *s;
++            switch (c) {
++            case '"': out.append(u"\\\""); break;
++            case '\\': out.append(u"\\\\"); break;
++            case '\n': out.append(u"\\n"); break;
++            case '\r': out.append(u"\\r"); break;
++            case '\t': out.append(u"\\t"); break;
++            default:
++                if (c < 0x20) {
++                    char buf[8];
++                    snprintf(buf, sizeof buf, "\\u%04x", unsigned(c));
++                    for (char *b = buf; *b; ++b) out.push_back(tjs_char(*b));
++                } else {
++                    out.push_back(c);
++                }
++            }
++        }
++        out.push_back('"');
++    }
++
++    static bool isArray(iTJSDispatch2 *obj) {
++        return obj->IsInstanceOf(0, nullptr, nullptr, TJS_W("Array"), obj) == TJS_S_TRUE;
++    }
++    static bool isFunction(const tTJSVariant &v) {
++        if (v.Type() != tvtObject) return false;
++        iTJSDispatch2 *obj = v.AsObjectNoAddRef();
++        return obj && (obj->IsInstanceOf(0, nullptr, nullptr, TJS_W("Function"), obj) == TJS_S_TRUE ||
++                       obj->IsInstanceOf(0, nullptr, nullptr, TJS_W("Class"), obj) == TJS_S_TRUE);
++    }
++
++    class Members : public tTJSDispatch {
++    public:
++        Writer *w;
++        bool first = true;
++        explicit Members(Writer *w) : w(w) {}
++        tjs_error FuncCall(tjs_uint32, const tjs_char *, tjs_uint32 *, tTJSVariant *result, tjs_int numparams,
++                           tTJSVariant **param, iTJSDispatch2 *) override {
++            if (numparams > 2 && !(param[1]->AsInteger() & TJS_HIDDENMEMBER) && !isFunction(*param[2])) {
++                if (!first) w->out.push_back(',');
++                first = false;
++                w->newline();
++                w->quote(param[0]->GetString());
++                w->out.push_back(':');
++                if (w->pretty) w->out.push_back(' ');
++                w->value(*param[2]);
++            }
++            if (result) *result = true;
++            return TJS_S_OK;
++        }
++    };
++
++    void value(const tTJSVariant &v) {
++        switch (v.Type()) {
++        case tvtVoid: out.append(u"null"); return;
++        case tvtInteger: {
++            ttstr s = tTJSVariant(v).AsString();
++            out.append(s.c_str());
++            return;
++        }
++        case tvtReal: {
++            double d = v.AsReal();
++            if (!std::isfinite(d)) { out.append(u"null"); return; }
++            char buf[40];
++            snprintf(buf, sizeof buf, "%.17g", d);
++            for (char *b = buf; *b; ++b) out.push_back(tjs_char(*b));
++            return;
++        }
++        case tvtString: quote(v.GetString()); return;
++        case tvtOctet: out.append(u"null"); return;
++        case tvtObject: break;
++        }
++        iTJSDispatch2 *obj = v.AsObjectNoAddRef();
++        if (!obj || depth > 64) { out.append(u"null"); return; }
++        if (isArray(obj)) {
++            tTJSVariant count;
++            obj->PropGet(0, TJS_W("count"), nullptr, &count, obj);
++            tjs_int n = count.Type() == tvtVoid ? 0 : tjs_int(count.AsInteger());
++            out.push_back('[');
++            depth++;
++            for (tjs_int i = 0; i < n; i++) {
++                if (i) out.push_back(',');
++                newline();
++                tTJSVariant item;
++                obj->PropGetByNum(0, i, &item, obj);
++                value(item);
++            }
++            depth--;
++            if (n) newline();
++            out.push_back(']');
++            return;
++        }
++        out.push_back('{');
++        depth++;
++        Members *members = new Members(this);
++        tTJSVariantClosure closure(members);
++        obj->EnumMembers(TJS_IGNOREPROP, &closure, obj);
++        bool any = !members->first;
++        members->Release();
++        depth--;
++        if (any) newline();
++        out.push_back('}');
++    }
++};
++
++ttstr stringify(const tTJSVariant &v, bool pretty) {
++    Writer w;
++    w.pretty = pretty;
++    w.value(v);
++    return ttstr(w.out.c_str());
++}
++
++ttstr readText(const ttstr &name) {
++    iTJSTextReadStream *stream = TVPCreateTextStreamForRead(name, TJS_W(""));
++    ttstr text;
++    try {
++        stream->Read(text, 0);
++    } catch (...) {
++        stream->Destruct();
++        throw;
++    }
++    stream->Destruct();
++    return text;
++}
++
++void writeText(const ttstr &name, const ttstr &text, bool utf8) {
++    tTJSBinaryStream *stream = TVPCreateStream(TVPNormalizeStorageName(name), TJS_BS_WRITE);
++    try {
++        if (utf8) {
++            std::u16string wide(text.c_str());
++            std::string bytes;
++            for (size_t i = 0; i < wide.size(); i++) {
++                uint32_t c = wide[i];
++                if (c >= 0xD800 && c <= 0xDBFF && i + 1 < wide.size() && wide[i + 1] >= 0xDC00 && wide[i + 1] <= 0xDFFF) {
++                    c = 0x10000 + ((c - 0xD800) << 10) + (wide[i + 1] - 0xDC00);
++                    i++;
++                }
++                if (c < 0x80) bytes.push_back(char(c));
++                else if (c < 0x800) { bytes.push_back(char(0xC0 | (c >> 6))); bytes.push_back(char(0x80 | (c & 0x3F))); }
++                else if (c < 0x10000) { bytes.push_back(char(0xE0 | (c >> 12))); bytes.push_back(char(0x80 | ((c >> 6) & 0x3F))); bytes.push_back(char(0x80 | (c & 0x3F))); }
++                else { bytes.push_back(char(0xF0 | (c >> 18))); bytes.push_back(char(0x80 | ((c >> 12) & 0x3F))); bytes.push_back(char(0x80 | ((c >> 6) & 0x3F))); bytes.push_back(char(0x80 | (c & 0x3F))); }
++            }
++            stream->WriteBuffer(bytes.data(), bytes.size());
++        } else {
++            const unsigned char bom[2] = {0xFF, 0xFE};
++            stream->WriteBuffer(bom, 2);
++            std::u16string wide(text.c_str());
++            for (char16_t c : wide) {
++                unsigned char b[2] = {(unsigned char)(c & 0xFF), (unsigned char)(c >> 8)};
++                stream->WriteBuffer(b, 2);
++            }
++        }
++    } catch (...) {
++        delete stream;
++        throw;
++    }
++    delete stream;
++}
++
++struct Scripts {
++    static tjs_error evalJSON(tTJSVariant *result, tjs_int numparams, tTJSVariant **param, iTJSDispatch2 *) {
++        if (numparams < 1) return TJS_E_BADPARAMCOUNT;
++        tTJSVariant v = parse(param[0]->AsString());
++        if (result) *result = v;
++        return TJS_S_OK;
++    }
++    static tjs_error evalJSONStorage(tTJSVariant *result, tjs_int numparams, tTJSVariant **param, iTJSDispatch2 *) {
++        if (numparams < 1) return TJS_E_BADPARAMCOUNT;
++        tTJSVariant v = parse(readText(param[0]->AsString()));
++        if (result) *result = v;
++        return TJS_S_OK;
++    }
++    static tjs_error saveJSON(tTJSVariant *result, tjs_int numparams, tTJSVariant **param, iTJSDispatch2 *) {
++        if (numparams < 2) return TJS_E_BADPARAMCOUNT;
++        bool utf8 = numparams > 2 && param[2]->Type() != tvtVoid && param[2]->AsInteger() != 0;
++        bool pretty = numparams > 3 && param[3]->Type() != tvtVoid && param[3]->AsInteger() != 0;
++        writeText(param[0]->AsString(), stringify(*param[1], pretty), utf8);
++        if (result) result->Clear();
++        return TJS_S_OK;
++    }
++    static tjs_error toJSONString(tTJSVariant *result, tjs_int numparams, tTJSVariant **param, iTJSDispatch2 *) {
++        if (numparams < 1) return TJS_E_BADPARAMCOUNT;
++        bool pretty = numparams > 1 && param[1]->Type() != tvtVoid && param[1]->AsInteger() != 0;
++        if (result) *result = stringify(*param[0], pretty);
++        return TJS_S_OK;
++    }
++};
++
++} // namespace
++
++NCB_ATTACH_CLASS(Scripts, Scripts) {
++    RawCallback("evalJSON", &Scripts::evalJSON, TJS_STATICMEMBER);
++    RawCallback("evalJSONStorage", &Scripts::evalJSONStorage, TJS_STATICMEMBER);
++    RawCallback("saveJSON", &Scripts::saveJSON, TJS_STATICMEMBER);
++    RawCallback("toJSONString", &Scripts::toJSONString, TJS_STATICMEMBER);
++}
+diff --git a/Engine/shiori_plugin_links.cpp b/Engine/shiori_plugin_links.cpp
+index 1f8a2d5..59feac5 100644
+--- a/Engine/shiori_plugin_links.cpp
++++ b/Engine/shiori_plugin_links.cpp
+@@ -40,6 +40,9 @@ NCB_POST_REGIST_CALLBACK(linkKAGParserEx);
+                                                              &shioriEmpty_##tag, nullptr);
+ SHIORI_EMPTY_PLUGIN(wuvorbis, "wuvorbis.dll")
+ SHIORI_EMPTY_PLUGIN(wuopus, "wuopus.dll")
++// MP3 (and AAC...) is decoded by the system now: environ/shiori_systemaudio.mm.
++SHIORI_EMPTY_PLUGIN(wump3, "wump3.dll")
++SHIORI_EMPTY_PLUGIN(krmp3, "krmp3.dll")
+ SHIORI_EMPTY_PLUGIN(krmovie, "krmovie.dll")
+ SHIORI_EMPTY_PLUGIN(SteamDrawDevice, "SteamDrawDevice.dll")
+ SHIORI_EMPTY_PLUGIN(drawdeviceD3DZ, "drawdeviceD3DZ.dll")
+diff --git a/Engine/shiorikrkr_host.mm b/Engine/shiorikrkr_host.mm
+index 86869b4..2077097 100644
+--- a/Engine/shiorikrkr_host.mm
++++ b/Engine/shiorikrkr_host.mm
+@@ -342,7 +342,12 @@ SHIORIKRKR_EXPORT int shiorikrkr_start(const shiorikrkr_config_t *config) {
+     };
+     services.gameRoot = root;
+     services.exeName = config->exe_name ? config->exe_name : "game.exe";
+-    NSString *temp = [NSTemporaryDirectory() stringByAppendingPathComponent:@"ShioriKrkr"];
++    // Where "$(appdatapath)", "$(personalpath)" and the engine's own files go. A host that keeps
++    // saves per game names a folder with SHIORIKRKR_DATA_PATH (games often keep their saves
++    // there, and the temporary folder is shared by every game and emptied by the system).
++    const char *chosen = getenv("SHIORIKRKR_DATA_PATH");
++    NSString *temp = chosen && *chosen ? [NSString stringWithUTF8String:chosen]
++                                       : [NSTemporaryDirectory() stringByAppendingPathComponent:@"ShioriKrkr"];
+     [NSFileManager.defaultManager createDirectoryAtPath:temp withIntermediateDirectories:YES attributes:nil error:nil];
+     services.dataPath = std::string(temp.UTF8String) + "/";
+     shiori::cursorChanged = cursorChanged;
+@@ -415,6 +420,7 @@ SHIORIKRKR_EXPORT int shiorikrkr_start(const shiorikrkr_config_t *config) {
+     _argv = h.argv.data();
+ 
+     TVPShioriPrepareRestart(); // a game played before in this process
++    ShioriRegisterSystemAudioDecoders(); // MP3, AAC and the like, through the system
+     ShioriPrefetchReset();
+     shiorikrkr::stopAllMovies(); // (and at the start too: nothing of an earlier game shows)
+     ++sessionCount;
+diff --git a/Engine/shiorikrkr_movie.cpp b/Engine/shiorikrkr_movie.cpp
+index 8c6af49..3bab672 100644
+--- a/Engine/shiorikrkr_movie.cpp
++++ b/Engine/shiorikrkr_movie.cpp
+@@ -42,6 +42,7 @@ extern "C" {
+ #include <libavcodec/avcodec.h>
+ #include <libavformat/avformat.h>
+ #include <libavutil/avutil.h>
++#include <libswscale/swscale.h>
+ }
+ 
+ namespace shiorikrkr {
+@@ -130,6 +131,9 @@ public:
+         if (audio_) audio_->Release();
+         if (video_) avcodec_free_context(&video_);
+         if (sound_) avcodec_free_context(&sound_);
++#ifdef SHIORI_HAS_SWSCALE
++        if (scaler_) sws_freeContext(scaler_);
++#endif
+         if (format_) avformat_close_input(&format_);
+         if (io_) {
+             av_freep(&io_->buffer);
+@@ -148,7 +152,8 @@ public:
+         format_->flags |= AVFMT_FLAG_CUSTOM_IO;
+         // Only the containers KiriKiri movies come in (the FFmpeg build has no others either),
+         // and no opening of further files or URLs a container might name.
+-        format_->format_whitelist = av_strdup("asf,mpeg,mpegvideo");
++        // Every container the linked FFmpeg reads (Shiori's own build has only the first three).
++        format_->format_whitelist = av_strdup("asf,mpeg,mpegvideo,mpegts,mov,mp4,m4a,3gp,3g2,mj2,ogg,matroska,webm,avi,flv,ivf,h264,m4v");
+         format_->protocol_whitelist = av_strdup("none");
+         format_->io_open = [](AVFormatContext *, AVIOContext **, const char *, int, AVDictionary **) {
+             return AVERROR(EPERM);
+@@ -524,8 +529,7 @@ private:
+             const int64_t ms = frameMs(frame, videoIndex_);
+             // Frames of another size than the stream's (a change mid-stream) are dropped: the
+             // layer copy and the host's overlay read them at the stream's size.
+-            if (ms + 1 < skipBeforeMs_ || frame->format != AV_PIX_FMT_YUV420P || frame->width != width_ ||
+-                frame->height != height_) {
++            if (ms + 1 < skipBeforeMs_ || frame->width != width_ || frame->height != height_) {
+                 av_frame_unref(frame);
+                 continue;
+             }
+@@ -540,7 +544,25 @@ private:
+             decoded->fileMs = ms;
+             decoded->ms = ms + loopOffsetMs_;
+             decoded->pixels.resize(size_t(frame->width) * frame->height * 4);
+-            convertYUV420(frame, decoded->pixels.data(), false); // the engine's bitmaps are RGBA too
++            if (frame->format == AV_PIX_FMT_YUV420P) {
++                convertYUV420(frame, decoded->pixels.data(), false); // the engine's bitmaps are RGBA too
++            } else {
++#ifndef SHIORI_HAS_SWSCALE
++                av_frame_unref(frame);
++                continue;
++#else
++                // Any other picture layout (4:2:2 or 4:4:4 Theora, full-range MJPEG, paletted, ...).
++                scaler_ = sws_getCachedContext(scaler_, frame->width, frame->height, AVPixelFormat(frame->format),
++                                               width_, height_, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
++                if (!scaler_) {
++                    av_frame_unref(frame);
++                    continue;
++                }
++                uint8_t *planes[4] = {decoded->pixels.data(), nullptr, nullptr, nullptr};
++                int strides[4] = {width_ * 4, 0, 0, 0};
++                sws_scale(scaler_, frame->data, frame->linesize, 0, frame->height, planes, strides);
++#endif
++            }
+             av_frame_unref(frame);
+             std::lock_guard<std::mutex> lock(queueMutex_);
+             queue_.push_back(std::move(decoded));
+@@ -580,6 +602,7 @@ private:
+     AVIOContext *io_ = nullptr;
+     AVFormatContext *format_ = nullptr;
+     AVCodecContext *video_ = nullptr, *sound_ = nullptr;
++    SwsContext *scaler_ = nullptr;
+     int videoIndex_ = -1, audioIndex_ = -1, audioChannels_ = 2;
+     iTVPSoundBuffer *audio_ = nullptr;
+     std::thread thread_;
+diff --git a/Engine/shiorikrkr_psbfile.cpp b/Engine/shiorikrkr_psbfile.cpp
+index 343e2b4..24716f7 100644
+--- a/Engine/shiorikrkr_psbfile.cpp
++++ b/Engine/shiorikrkr_psbfile.cpp
+@@ -24,6 +24,7 @@
+ #include <zlib.h>
+ #include <algorithm>
+ #include <cctype>
++#include <cstdio>
+ #include <chrono>
+ #include <cstring>
+ #include <map>
+@@ -103,7 +104,24 @@ public:
+             out.resize(length);
+             b_.swap(out);
+         }
+-        if (b_.size() < 0x28 || std::memcmp(b_.data(), "PSB\0", 4)) return fail(error, "not a PSB");
++        if (b_.size() >= 12 && !std::memcmp(b_.data(), "mdf\0", 4)) {
++            // KiriKiri Z's packed PSB (scene .scn files, .pimg, .psb.m): "mdf", the inflated
++            // length, then a zlib stream to the end.
++            const uint32_t size = u32(4);
++            if (size > kMaxInflated) return fail(error, "mdf too large");
++            std::vector<uint8_t> out(size);
++            uLongf length = size;
++            if (uncompress(out.data(), &length, b_.data() + 8, uLong(b_.size() - 8)) != Z_OK)
++                return fail(error, "mdf inflate (the archive may encrypt it)");
++            out.resize(length);
++            b_.swap(out);
++        }
++        if (b_.size() < 0x28 || std::memcmp(b_.data(), "PSB\0", 4)) {
++            char head[48];
++            std::snprintf(head, sizeof head, "not a PSB (starts %02x %02x %02x %02x)", b_.size() > 0 ? b_[0] : 0,
++                          b_.size() > 1 ? b_[1] : 0, b_.size() > 2 ? b_[2] : 0, b_.size() > 3 ? b_[3] : 0);
++            return fail(error, head);
++        }
+         const int flags = b_[6] | b_[7] << 8;
+         if (flags & 1) return fail(error, "encrypted PSB header");
+         const size_t names = u32(12), strings = u32(16);
+diff --git a/Scripts/krkr2/build-framework.sh b/Scripts/krkr2/build-framework.sh
+index 0b64ba3..1937cb9 100755
+--- a/Scripts/krkr2/build-framework.sh
++++ b/Scripts/krkr2/build-framework.sh
+@@ -17,6 +17,16 @@ ENGINE="$ROOT/Engine"
+ # FFmpeg: built by github.com/OWCramer/shiori (Scripts/ffmpeg), checked out beside this repository.
+ FFMPEG="${SHIORI_FFMPEG:-$ROOT/../shiori}"
+ VENDOR="$ROOT/Vendor"
++# 口袋软盘 builds its own FFmpeg with more demuxers and decoders (MP4/H.264/AAC, Ogg Theora/Vorbis,
++# AVI, WebM VP8/VP9, ...): ~/Library/Developer/APKNovel-work/ffmpeg/build.sh, out/{sim,dev}/{include,lib}.
++POCKET_FFMPEG="${POCKET_FFMPEG:-$HOME/Library/Developer/APKNovel-work/ffmpeg/out}"
++ffmpeg_flags() { # sim|dev xcframework-slice
++    if [ -f "$POCKET_FFMPEG/$1/lib/libffmpeg.a" ]; then
++        echo "-DFFMPEG_INCLUDE=$POCKET_FFMPEG/$1/include -DFFMPEG_LIBRARY=$POCKET_FFMPEG/$1/lib/libffmpeg.a"
++    else
++        echo "-DFFMPEG_INCLUDE=$FFMPEG/Vendor/ShioriFFmpeg.xcframework/$2/Headers -DFFMPEG_LIBRARY=$FFMPEG/Vendor/ShioriFFmpeg.xcframework/$2/libffmpeg.a"
++    fi
++}
+ WORK="$ROOT/build/shiorikrkr"
+ NAME=ShioriKrkr
+ MIN_IOS=17.0
+@@ -84,16 +94,14 @@ for slice in "${SLICES[@]}"; do
+     simulator)
+         configure_and_build simulator arm64-ios-simulator -DCMAKE_SYSTEM_NAME=iOS \
+             -DCMAKE_OSX_SYSROOT=iphonesimulator -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=$MIN_IOS \
+-            -DFFMPEG_INCLUDE="$FFMPEG/Vendor/ShioriFFmpeg.xcframework/ios-arm64-simulator/Headers" \
+-            -DFFMPEG_LIBRARY="$FFMPEG/Vendor/ShioriFFmpeg.xcframework/ios-arm64-simulator/libffmpeg.a"
++            $(ffmpeg_flags sim ios-arm64-simulator)
+         make_framework simulator iPhoneSimulator
+         built+=(-framework "$WORK/frameworks/simulator/$NAME.framework")
+         ;;
+     device)
+         configure_and_build device arm64-ios -DCMAKE_SYSTEM_NAME=iOS \
+             -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=$MIN_IOS \
+-            -DFFMPEG_INCLUDE="$FFMPEG/Vendor/ShioriFFmpeg.xcframework/ios-arm64/Headers" \
+-            -DFFMPEG_LIBRARY="$FFMPEG/Vendor/ShioriFFmpeg.xcframework/ios-arm64/libffmpeg.a"
++            $(ffmpeg_flags dev ios-arm64)
+         make_framework device iPhoneOS
+         built+=(-framework "$WORK/frameworks/device/$NAME.framework")
+         ;;
+-- 
+2.54.0 (Apple Git-157)
+
